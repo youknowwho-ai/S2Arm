@@ -342,7 +342,42 @@ void s2a_joycon1_rumble_encode(s2a_pad_vibration v, uint8_t out[4]) {
 enum { JC1_E = 1u << 0, JC1_S = 1u << 1, JC1_N = 1u << 2, JC1_W = 1u << 3, JC1_LS = 1u << 4, JC1_RS = 1u << 5, JC1_L = 1u << 6, JC1_R = 1u << 7,
        JC1_ZL = 1u << 8, JC1_ZR = 1u << 9, JC1_PLUS = 1u << 10, JC1_MINUS = 1u << 11, JC1_DL = 1u << 12, JC1_DU = 1u << 13, JC1_DR = 1u << 14, JC1_DD = 1u << 15 };
 static int32_t jc1_axis(unsigned raw) { int v = ((int)raw - 2048) * 16; return v > 32767 ? 32767 : v < -32767 ? -32767 : v; }
-int s2a_joycon1_decode(int pid, const uint8_t *report, size_t length, uint32_t *buttons, int32_t sticks[4], int *side) {
+static int jc1_cal_valid(const s2a_joycon1_calibration *cal) {
+    if (!cal) return 0;
+    for (int i = 0; i < 2; i++)
+        if (!cal->center[i] || cal->center[i] >= 4095 || !cal->above[i] || !cal->below[i] ||
+            cal->above[i] > 4095 - cal->center[i] || cal->below[i] > cal->center[i]) return 0;
+    return 1;
+}
+static void jc1_unpack(const uint8_t *p, uint16_t out[2]) {
+    out[0] = p[0] | (p[1] & 15) << 8;
+    out[1] = p[1] >> 4 | p[2] << 4;
+}
+int s2a_joycon1_calibration_parse(int pid, const uint8_t record[9], s2a_joycon1_calibration *out) {
+    if (!record || !out || (pid != 0x2006 && pid != 0x2007)) return 0;
+    int right = pid == 0x2007;
+    s2a_joycon1_calibration cal;
+    jc1_unpack(record + (right ? 0 : 3), cal.center);
+    jc1_unpack(record + (right ? 6 : 0), cal.above);
+    jc1_unpack(record + (right ? 3 : 6), cal.below);
+    if (!jc1_cal_valid(&cal)) return 0;
+    *out = cal;
+    return 1;
+}
+int s2a_joycon1_calibration_axis(const s2a_joycon1_calibration *cal, unsigned axis, unsigned raw, int32_t *out) {
+    if (!out || axis > 1 || raw > 4095 || !jc1_cal_valid(cal)) return 0;
+    int delta = (int)raw - cal->center[axis];
+    int extent = delta < 0 ? cal->below[axis] : cal->above[axis];
+    int value = delta * 32767 / extent;
+    *out = value < -32767 ? -32767 : value > 32767 ? 32767 : value;
+    return 1;
+}
+static int32_t jc1_cal_axis(const s2a_joycon1_calibration *cal, unsigned axis, unsigned raw) {
+    int32_t value;
+    return s2a_joycon1_calibration_axis(cal, axis, raw, &value) ? value : jc1_axis(raw);
+}
+int s2a_joycon1_decode_calibrated(int pid, const uint8_t *report, size_t length, const s2a_joycon1_calibration *cal,
+                                uint32_t *buttons, int32_t sticks[4], int *side) {
     if (!report || !buttons || !sticks || !side) return 0;
     *buttons = 0; *side = 0; for (int i = 0; i < 4; i++) sticks[i] = 0;
     size_t off = length && (report[0] == 0x30 || report[0] == 0x3f) ? 1 : 0;   // IOHID 有时把报告号放在第一个字节
@@ -383,7 +418,7 @@ int s2a_joycon1_decode(int pid, const uint8_t *report, size_t length, uint32_t *
         if (b[2] & 0x20) { out |= JC1_L; *side |= S2A_JC1_SIDE_SL; }
         if (b[2] & 0x10) { out |= JC1_R; *side |= S2A_JC1_SIDE_SR; }
         if (b[1] & 0x01) out |= JC1_MINUS; if (b[1] & 0x08) out |= JC1_LS; if (b[1] & 0x20) out |= JC1_PLUS;   // Capture 当 +（单只没有 +）
-        sticks[0] = jc1_axis(lx); sticks[1] = jc1_axis(ly);
+        sticks[0] = jc1_cal_axis(cal, 0, lx); sticks[1] = jc1_cal_axis(cal, 1, ly);
     } else if (pid == 0x2007) {   // 右只：面键照原样（横握由游戏 HoldType 解释），SL / SR 当 L / R
         if (b[0] & 0x08) out |= JC1_E; if (b[0] & 0x04) out |= JC1_S; if (b[0] & 0x02) out |= JC1_N; if (b[0] & 0x01) out |= JC1_W;
         if (b[0] & 0x40) { out |= JC1_R; *side |= S2A_JC1_SIDE_SHOULDER; }
@@ -391,10 +426,13 @@ int s2a_joycon1_decode(int pid, const uint8_t *report, size_t length, uint32_t *
         if (b[0] & 0x20) { out |= JC1_L; *side |= S2A_JC1_SIDE_SL; }
         if (b[0] & 0x10) { out |= JC1_R; *side |= S2A_JC1_SIDE_SR; }
         if (b[1] & 0x02) out |= JC1_PLUS; if (b[1] & 0x04) out |= JC1_RS; if (b[1] & 0x10) out |= JC1_MINUS;   // Home 当 −（单只没有 −）
-        sticks[2] = jc1_axis(rx); sticks[3] = jc1_axis(ry);
+        sticks[2] = jc1_cal_axis(cal, 0, rx); sticks[3] = jc1_cal_axis(cal, 1, ry);
     } else return 0;
     *buttons = out;
     return 1;
+}
+int s2a_joycon1_decode(int pid, const uint8_t *report, size_t length, uint32_t *buttons, int32_t sticks[4], int *side) {
+    return s2a_joycon1_decode_calibrated(pid, report, length, NULL, buttons, sticks, side);
 }
 void s2a_joycon1_pair_decode(const uint8_t *left, const uint8_t *right, uint32_t *buttons, int32_t sticks[4]) {
     static const uint8_t idle[S2A_JC1_RAW] = {0, 0, 0, 0, 0, 0x00, 0x08, 0x80, 0x00, 0x08, 0x80};   // 没按、两个摇杆居中（2048）
@@ -405,4 +443,16 @@ void s2a_joycon1_pair_decode(const uint8_t *left, const uint8_t *right, uint32_t
     int side;
     if (!s2a_joycon1_decode(0x2009, report, sizeof report, buttons, sticks, &side)) { *buttons = 0; for (int i = 0; i < 4; i++) sticks[i] = 0; }
 }
-
+void s2a_joycon1_pair_decode_calibrated(const uint8_t *left, const uint8_t *right,
+                                      const s2a_joycon1_calibration *left_cal, const s2a_joycon1_calibration *right_cal,
+                                      uint32_t *buttons, int32_t sticks[4]) {
+    s2a_joycon1_pair_decode(left, right, buttons, sticks);
+    if (left) {
+        sticks[0] = jc1_cal_axis(left_cal, 0, left[5] | (left[6] & 15) << 8);
+        sticks[1] = jc1_cal_axis(left_cal, 1, left[6] >> 4 | left[7] << 4);
+    }
+    if (right) {
+        sticks[2] = jc1_cal_axis(right_cal, 0, right[8] | (right[9] & 15) << 8);
+        sticks[3] = jc1_cal_axis(right_cal, 1, right[9] >> 4 | right[10] << 4);
+    }
+}

@@ -137,4 +137,17 @@ int s2a_joycon1_decode(int pid, const uint8_t *report, size_t length, uint32_t *
 enum { S2A_JC1_RAW = 11 };
 void s2a_joycon1_pair_decode(const uint8_t *left, const uint8_t *right, uint32_t *buttons, int32_t sticks[4]);
 
+// 一代单只摇杆的 SPI 校准：中心及两个方向各自的行程（12 位原始单位）。
+// L 的 9 字节顺序为 above/center/below，R 为 center/below/above；无效记录不改 out。
+// 归一化不含死区或握法旋转；只供单只 Joy-Con，Pro 保留原解码。
+typedef struct { uint16_t center[2], above[2], below[2]; } s2a_joycon1_calibration;
+int s2a_joycon1_calibration_parse(int pid, const uint8_t record[9], s2a_joycon1_calibration *out);
+int s2a_joycon1_calibration_axis(const s2a_joycon1_calibration *cal, unsigned axis, unsigned raw, int32_t *out);
+int s2a_joycon1_decode_calibrated(int pid, const uint8_t *report, size_t length, const s2a_joycon1_calibration *cal,
+                                uint32_t *buttons, int32_t sticks[4], int *side);
+// cal 与同侧 raw 属于同一次设备连接；NULL 校准保留旧解码，缺失 raw 的那侧始终为零。
+void s2a_joycon1_pair_decode_calibrated(const uint8_t *left, const uint8_t *right,
+                                      const s2a_joycon1_calibration *left_cal, const s2a_joycon1_calibration *right_cal,
+                                      uint32_t *buttons, int32_t sticks[4]);
+
 #endif

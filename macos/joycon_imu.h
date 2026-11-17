@@ -24,6 +24,9 @@ int s2a_joycon_list(s2a_joycon_info *out, int max);   // 现在接着的（按�
 int s2a_joycon_pad_read_id(const char *id, uint32_t *buttons, int32_t sticks[4], int *side, int *pid);
 // 最近一笔标准全报告的原始字节（给 s2a_joycon1_pair_decode 拼一对）；没有 / 太旧回 0
 int s2a_joycon_pad_raw_id(const char *id, uint8_t raw[S2A_JC1_RAW]);
+// 同一锁内取得同一次连接的 raw 和校准；尚无有效校准时 cal 清零（解码器沿用旧映射）。
+// 不返回借用指针，调用方拥有快照；新鲜度与 raw_id 相同。
+int s2a_joycon_pad_snapshot_id(const char *id, uint8_t raw[S2A_JC1_RAW], s2a_joycon1_calibration *cal);
 int s2a_joycon_imu_read_id(const char *id, s2a_pad_motion *out);   // 这一只的六轴（体感开着时）
 int s2a_joycon_rumble_id(const char *id, const s2a_pad_vibration pair[2]);   // 这一只的 HID 震动；没这只回 0
 

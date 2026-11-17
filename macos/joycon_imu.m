@@ -32,6 +32,13 @@ typedef struct {
     uint64_t pad_us;
     uint8_t pad_raw[S2A_JC1_RAW];   // 最近一笔标准全报告的按键 / 摇杆原始字节（按设备读的一对拼成一份，s2a_joycon1_pair_decode）
     int pad_raw_known;
+    s2a_joycon1_calibration calibration;
+    int calibration_known;
+    int cal_phase, cal_pending; // 0 not started, 1 user, 2 factory, 3 finished
+    unsigned cal_tries;
+    uint64_t cal_serial, cal_generation;
+    uint32_t cal_address;
+    uint8_t cal_length;
 } jc_dev;
 
 static IOHIDManagerRef g_mgr;
@@ -90,6 +97,120 @@ static void send_attach_sub(jc_dev *d, IOHIDDeviceRef device, uint64_t generatio
     CFRelease(target);
 }
 
+// Read-only SPI, at most two attempts per user/factory record per attachment.
+// Never wait for an input callback on the manager's main runloop. Packet numbers
+// and requests are reserved under g_mu; all transport I/O is outside that lock.
+static void request_calibration(jc_dev *d, IOHIDDeviceRef device, uint64_t generation) {
+    struct { uint8_t bytes[0x40]; } packet;
+    IOHIDDeviceRef target = NULL;
+    uint64_t serial = 0;
+    pthread_mutex_lock(&g_mu);
+    if (d->device == device && d->generation == generation &&
+        (d->product_id == JC_PID_L || d->product_id == JC_PID_R) &&
+        (atomic_load(&g_want) || atomic_load(&g_pad_want)) && d->cal_phase != 3 && !d->cal_pending) {
+        if (!d->cal_phase) d->cal_phase = 1;
+        int right = d->product_id == JC_PID_R;
+        d->cal_address = d->cal_phase == 1 ? (right ? 0x801b : 0x8010) : (right ? 0x6046 : 0x603d);
+        d->cal_length = d->cal_phase == 1 ? 11 : 9;
+        if (prepare_sub_locked(d, 0x10, 0, packet.bytes)) {
+            for (int i = 0; i < 4; i++) packet.bytes[11 + i] = (uint8_t)(d->cal_address >> (8 * i));
+            packet.bytes[15] = d->cal_length;
+            d->cal_pending = 1;
+            d->cal_tries++;
+            d->cal_generation = generation;
+            serial = ++d->cal_serial;
+            target = (IOHIDDeviceRef)CFRetain(device);
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (!target) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        pthread_mutex_lock(&g_mu);
+        int current = d->device == target && d->generation == generation &&
+                      d->cal_pending && d->cal_serial == serial;
+        pthread_mutex_unlock(&g_mu);
+        if (current) IOHIDDeviceSetReport(target, kIOHIDReportTypeOutput, 0x01, packet.bytes, sizeof packet.bytes);
+        CFRelease(target);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        pthread_mutex_lock(&g_mu);
+        int current = d->device == device && d->generation == generation &&
+                      d->cal_pending && d->cal_serial == serial;
+        int exhausted = 0;
+        int pid = d->product_id;
+        if (current) {
+            d->cal_pending = 0;
+            if (d->cal_tries >= 2) { d->cal_phase++; d->cal_tries = 0; }
+            exhausted = d->cal_phase == 3;
+        }
+        pthread_mutex_unlock(&g_mu);
+        if (exhausted) fprintf(stderr, "[输入] 一代 Joy-Con %s：摇杆校准读取超时，本次连接沿用未校准映射\n", pid == JC_PID_L ? "L" : "R");
+        if (current) request_calibration(d, device, generation);
+    });
+}
+
+static void request_all_calibrations(void) {
+    for (int i = 0; i < JC_N; i++) {
+        pthread_mutex_lock(&g_mu);
+        IOHIDDeviceRef device = g_dev[i].device;
+        uint64_t generation = g_dev[i].generation;
+        pthread_mutex_unlock(&g_mu);
+        if (device) request_calibration(&g_dev[i], device, generation);
+    }
+}
+
+static void apply_calibration_report(jc_dev *d, IOHIDDeviceRef source, const uint8_t *report, CFIndex len) {
+    if (!report || len <= 0) return;
+    pthread_mutex_lock(&g_mu);
+    if (d->device != source || !d->cal_pending || d->cal_generation != d->generation) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    const uint8_t *data = NULL;
+    // IOHID may include or omit the report ID. Try both only when the first
+    // byte is 0x21 (an omitted-ID timer can itself be 0x21); validate the entire
+    // response header, including all four address bytes, before accepting it.
+    for (CFIndex off = 0; off <= (report[0] == 0x21 ? 1 : 0); off++) {
+        if (len - off < 19 || report[off + 12] != 0x90 || report[off + 13] != 0x10) continue;
+        uint32_t address = 0;
+        for (int i = 0; i < 4; i++) address |= (uint32_t)report[off + 14 + i] << (8 * i);
+        unsigned length = report[off + 18];
+        if (address == d->cal_address && length == d->cal_length && len - off - 19 >= length) {
+            data = report + off + 19;
+            break;
+        }
+    }
+    if (!data) { pthread_mutex_unlock(&g_mu); return; }
+    uint64_t generation = d->generation;
+    int pid = d->product_id;
+    s2a_joycon1_calibration cal;
+    int user = d->cal_phase == 1;
+    int valid = (!user || (data[0] == 0xb2 && data[1] == 0xa1)) &&
+                s2a_joycon1_calibration_parse(d->product_id, data + (user ? 2 : 0), &cal);
+    d->cal_pending = 0;
+    if (valid) {
+        d->calibration = cal;
+        d->calibration_known = 1;
+        d->cal_phase = 3;
+        // Publish the latest sample with the new scale immediately, without
+        // waiting for the next input report or refreshing its freshness time.
+        if (d->pad_raw_known) {
+            uint8_t full[49] = {0x30};
+            memcpy(full + 1, d->pad_raw, S2A_JC1_RAW);
+            s2a_joycon1_decode_calibrated(d->product_id, full, sizeof full, &cal,
+                                        &d->pad_buttons, d->pad_sticks, &d->pad_side);
+        }
+    } else {
+        d->cal_phase++;
+        d->cal_tries = 0;
+    }
+    int exhausted = d->cal_phase == 3 && !valid;
+    pthread_mutex_unlock(&g_mu);
+    if (valid) fprintf(stderr, "[输入] 一代 Joy-Con %s：已读取%s摇杆校准\n", pid == JC_PID_L ? "L" : "R", user ? "用户" : "出厂");
+    if (exhausted) fprintf(stderr, "[输入] 一代 Joy-Con %s：摇杆校准记录无效，本次连接沿用未校准映射\n", pid == JC_PID_L ? "L" : "R");
+    if (!valid) request_calibration(d, source, generation);
+}
+
 // Joy-Con 报告里的加速度 / 角速度 → 近似 NS2 原始坐标（g、度/秒）。
 // 竖握：L/R 机身轴不同；Fit Boxing 横握挥拳时主要靠角速度幅值，先保证有读数。
 static void decode_imu(int slot, int product_id, const uint8_t *s, s2a_pad_motion *out) {
@@ -113,30 +234,39 @@ static void decode_imu(int slot, int product_id, const uint8_t *s, s2a_pad_motio
 }
 
 static void apply_report(jc_dev *d, IOHIDDeviceRef source, uint32_t report_id, const uint8_t *report, CFIndex len) {
-    if (!d || (report_id != 0x30 && report_id != 0x3f)) return;
+    if (!d || !report || len <= 0) return;
+    if (report_id == 0x21) { apply_calibration_report(d, source, report, len); return; }
+    if (report_id != 0x30 && report_id != 0x3f) return;
+    // IOHID supplies report_id separately. A full report's timer (or a simple
+    // report's first button byte) can equal that ID, so use the packet length
+    // to locate the payload before passing a canonical ID-prefixed packet on.
+    // USB full reports can carry padding to 64 bytes; it is not input data.
+    CFIndex payload_len = report_id == 0x30 ? 48 : 11;
+    CFIndex at;
+    if (len == payload_len || (report_id == 0x30 && len == 63)) at = 0;
+    else if ((len == payload_len + 1 || (report_id == 0x30 && len == 64)) && report[0] == report_id) at = 1;
+    else return;
+    uint8_t packet[49];
+    packet[0] = (uint8_t)report_id;
+    memcpy(packet + 1, report + at, (size_t)payload_len);
     pthread_mutex_lock(&g_mu);
     int pid = d->device && d->device == source ? d->product_id : 0, slot = d->slot;
-    pthread_mutex_unlock(&g_mu);
-    if (!pid) return;
+    uint64_t generation = d->generation;
+    if (!pid) { pthread_mutex_unlock(&g_mu); return; }
     // D2：按键 / 摇杆按设备存（0x30 全报告、0x3F 简单报告都认）
     uint32_t buttons; int32_t sticks[4]; int side;
-    if (s2a_joycon1_decode(pid, report, (size_t)len, &buttons, sticks, &side)) {
-        pthread_mutex_lock(&g_mu);
-        if (d->device != source) { pthread_mutex_unlock(&g_mu); return; }
+    if (s2a_joycon1_decode_calibrated(pid, packet, (size_t)payload_len + 1, d->calibration_known ? &d->calibration : NULL, &buttons, sticks, &side)) {
         d->pad_buttons = buttons; memcpy(d->pad_sticks, sticks, sizeof sticks); d->pad_side = side; d->pad_known = 1; d->pad_us = now_us();
-        CFIndex at = (len > 0 && report[0] == report_id) ? 1 : 0;
-        if (report_id == 0x30 && len - at >= S2A_JC1_RAW) { memcpy(d->pad_raw, report + at, S2A_JC1_RAW); d->pad_raw_known = 1; }
-        pthread_mutex_unlock(&g_mu);
+        if (report_id == 0x30) { memcpy(d->pad_raw, packet + 1, S2A_JC1_RAW); d->pad_raw_known = 1; }
     }
+    pthread_mutex_unlock(&g_mu);
     if (report_id != 0x30) return;
-    int off = (len > 0 && report[0] == 0x30) ? 1 : 0;
-    if (len - off < 48) return;
     // 标准全报告带 3 组 IMU（5 ms 间隔）；取最后一组
-    const uint8_t *s = report + off + 36;
+    const uint8_t *s = packet + 37;
     s2a_pad_motion m = {0};
     decode_imu(slot, pid, s, &m);
     pthread_mutex_lock(&g_mu);
-    if (d->device == source) { d->sample = m; d->known = 1; }
+    if (d->device == source && d->generation == generation) { d->sample = m; d->known = 1; }
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -254,6 +384,7 @@ static void attach_device(IOHIDDeviceRef device) {
         fprintf(stderr, "[输入] Joy-Con HID 六轴：已接通 %s（shared）\n",
                 pid == JC_PID_L ? "L" : (pid == JC_PID_PRO ? "Pro" : "R"));
     }
+    if (want || pad_want) request_calibration(d, device, generation);
 }
 
 static void detach_device(IOHIDDeviceRef device) {
@@ -321,6 +452,7 @@ void s2a_joycon_imu_set_enabled(int enabled) {
     pthread_mutex_lock(&g_mu);
     apply_enabled_locked(on);
     pthread_mutex_unlock(&g_mu);
+    if (on) request_all_calibrations();
     if (on) fprintf(stderr, "[输入] Joy-Con HID 六轴：开启（GameController 无 motion 时的回退）\n");
     else fprintf(stderr, "[输入] Joy-Con HID 六轴：关闭\n");
 }
@@ -411,6 +543,7 @@ void s2a_joycon_pad_set_enabled(int enabled) {
         if (!on) d->pad_known = 0;
     }
     pthread_mutex_unlock(&g_mu);
+    if (on) request_all_calibrations();
     fprintf(stderr, "[输入] 一代 Joy-Con 按设备读按键：%s\n", on ? "开（D2）" : "关");
 }
 
@@ -438,10 +571,16 @@ int s2a_joycon_pad_read_id(const char *id, uint32_t *buttons, int32_t sticks[4],
 }
 
 int s2a_joycon_pad_raw_id(const char *id, uint8_t raw[S2A_JC1_RAW]) {
+    return s2a_joycon_pad_snapshot_id(id, raw, NULL);
+}
+
+int s2a_joycon_pad_snapshot_id(const char *id, uint8_t raw[S2A_JC1_RAW], s2a_joycon1_calibration *cal) {
+    if (!raw) return 0;
     pthread_mutex_lock(&g_mu);
     jc_dev *d = find_id_locked(id);
     int ok = d && d->pad_raw_known && now_us() - d->pad_us <= 250000;
     if (ok) memcpy(raw, d->pad_raw, S2A_JC1_RAW);
+    if (cal) { memset(cal, 0, sizeof *cal); if (ok && d->calibration_known) *cal = d->calibration; }
     pthread_mutex_unlock(&g_mu);
     return ok;
 }

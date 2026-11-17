@@ -1330,8 +1330,9 @@ static void sample_input(void) {
                 if (!u) continue;
                 taken[li] = taken[ri] = YES;
                 uint8_t lraw[S2A_JC1_RAW], rraw[S2A_JC1_RAW]; uint32_t b; int32_t st[4];
-                int lok = s2a_joycon_pad_raw_id(left, lraw), rok = s2a_joycon_pad_raw_id(bar + 1, rraw);
-                s2a_joycon1_pair_decode(lok ? lraw : NULL, rok ? rraw : NULL, &b, st);
+                s2a_joycon1_calibration lcal, rcal;
+                int lok = s2a_joycon_pad_snapshot_id(left, lraw, &lcal), rok = s2a_joycon_pad_snapshot_id(bar + 1, rraw, &rcal);
+                s2a_joycon1_pair_decode_calibrated(lok ? lraw : NULL, rok ? rraw : NULL, &lcal, &rcal, &b, st);
                 gen1_state[u - g_gen1] = (ns2_state){.buttons = b, .lx = st[0], .ly = st[1], .rx = st[2], .ry = st[3]};
                 live_ids[n] = u; live_pads[n] = nil; live_ctrls[n] = nil; live_ble[n] = S2A_PAD_ORDER_GEN1_PAIR; live_key[n] = u->key; n++;
             }
@@ -1345,8 +1346,10 @@ static void sample_input(void) {
             ns2_kind kind = jc[i].pid == 0x2006 ? NS2_KIND_JOYCON_L : NS2_KIND_JOYCON_R;
             u->side_keys = 0;
             uint8_t raw[S2A_JC1_RAW];
-            if (s2a_mac_ns2_raw_wanted(kind, atomic_load(&u->style)) && s2a_joycon_pad_raw_id(jc[i].id, raw)) {
-                s2a_joycon1_pair_decode(kind == NS2_KIND_JOYCON_L ? raw : NULL, kind == NS2_KIND_JOYCON_R ? raw : NULL, &b, st);
+            s2a_joycon1_calibration cal;
+            if (s2a_mac_ns2_raw_wanted(kind, atomic_load(&u->style)) && s2a_joycon_pad_snapshot_id(jc[i].id, raw, &cal)) {
+                s2a_joycon1_pair_decode_calibrated(kind == NS2_KIND_JOYCON_L ? raw : NULL, kind == NS2_KIND_JOYCON_R ? raw : NULL,
+                                                 &cal, &cal, &b, st);
                 int left = kind == NS2_KIND_JOYCON_L;
                 if (sides & S2A_JC1_SIDE_SL) u->side_keys |= left ? 1u << 24 : 1u << 26;
                 if (sides & S2A_JC1_SIDE_SR) u->side_keys |= left ? 1u << 25 : 1u << 27;
